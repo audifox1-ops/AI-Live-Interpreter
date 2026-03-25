@@ -340,6 +340,8 @@ export default function InterpreterPage() {
   const audioQueueRef = useRef<Int16Array[]>([]);
   const isPlayingRef = useRef(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<TranscriptItem[]>([]);
+  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
 
   // Hydration fix & Clock
   useEffect(() => {
@@ -384,9 +386,21 @@ export default function InterpreterPage() {
         if (sessionRef.current && isConnected) {
           const input = e.inputBuffer.getChannelData(0);
           const pcm = new Int16Array(input.length);
-          for (let i = 0; i < input.length; i++) pcm[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(pcm.buffer)));
-          sessionRef.current.sendRealtimeInput({ audio: { data: base64, mimeType: 'audio/pcm;rate=16000' } });
+          for (let i = 0; i < input.length; i++) {
+            pcm[i] = Math.max(-1, Math.min(1, input[i])) * 0x7FFF;
+          }
+          
+          const uint8 = new Uint8Array(pcm.buffer);
+          let binary = '';
+          const len = uint8.byteLength;
+          for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(uint8[i]);
+          }
+          const base64 = btoa(binary);
+          
+          sessionRef.current.sendRealtimeInput({ 
+            audio: { data: base64, mimeType: 'audio/pcm;rate=16000' } 
+          });
         }
         
         const data = new Uint8Array(analyser.frequencyBinCount);
@@ -395,17 +409,12 @@ export default function InterpreterPage() {
         setMicLevel(average / 128);
       };
 
+      processorRef.current = processor;
       setIsRecording(true);
       setError(null);
     } catch (err: any) {
       console.error("Mic error:", err);
-      if (err.name === 'NotAllowedError') {
-        setError("마이크 접근 권한이 거부되었습니다.");
-      } else if (err.name === 'NotFoundError') {
-        setError("마이크를 찾을 수 없습니다.");
-      } else {
-        setError("마이크 시작 중 오류가 발생했습니다.");
-      }
+      setError("마이크 시작 중 오류가 발생했습니다: " + (err.message || "권한을 확인해 주세요."));
     }
   };
 
@@ -423,12 +432,15 @@ export default function InterpreterPage() {
     const float = new Float32Array(pcm.length);
     for (let i = 0; i < pcm.length; i++) float[i] = pcm[i] / 0x7FFF;
 
-    const buffer = audioContextRef.current.createBuffer(1, float.length, 16000);
+    const buffer = audioContextRef.current.createBuffer(1, float.length, 24000);
     buffer.getChannelData(0).set(float);
     const source = audioContextRef.current.createBufferSource();
     source.buffer = buffer;
     source.connect(audioContextRef.current.destination);
-    source.onended = () => { isPlayingRef.current = false; playQueue(); };
+    source.onended = () => { 
+      isPlayingRef.current = false; 
+      playQueue(); 
+    };
     source.start();
   };
 
@@ -468,18 +480,23 @@ export default function InterpreterPage() {
         config: {
           responseModalities: [Modality.AUDIO],
           systemInstruction: isManualMode 
-            ? `You are a professional interpreter. Translate ONLY from ${sourceLang} to ${targetLang}. If the user speaks ${targetLang}, do not translate. Provide ONLY the translation as audio.`
-            : `You are a professional interpreter. Translate ${sourceLang} to ${targetLang} and vice versa. Provide ONLY the translation as audio.`,
+            ? `You are a professional interpreter. Translate ONLY from ${sourceLang} to ${targetLang}. If the user speaks ${targetLang}, do not translate. Provide the translation as both high-quality audio and clear text transcription.`
+            : `You are a professional interpreter. Translate ${sourceLang} to ${targetLang} and vice versa. Provide the translation as both high-quality audio and clear text transcription.`,
           outputAudioTranscription: {},
           inputAudioTranscription: {},
         },
         callbacks: {
-          onopen: () => { setIsConnected(true); setIsConnecting(false); startMic(); },
+          onopen: () => { 
+            console.log("Session Opened");
+            setIsConnected(true); 
+            setIsConnecting(false); 
+            startMic(); 
+          },
           onmessage: (msg: LiveServerMessage) => {
             // Handle Audio Output
-            const base64 = msg.serverContent?.modelTurn?.parts?.find(p => p.inlineData)?.inlineData?.data;
-            if (base64) {
-              const binary = atob(base64);
+            const base64Data = msg.data;
+            if (base64Data) {
+              const binary = atob(base64Data);
               const bytes = new Uint8Array(binary.length);
               for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
               audioQueueRef.current.push(new Int16Array(bytes.buffer));
@@ -489,37 +506,49 @@ export default function InterpreterPage() {
             // Handle Interruption
             if (msg.serverContent?.interrupted) {
               audioQueueRef.current = [];
+              isPlayingRef.current = false;
             }
 
             // Handle Transcriptions
-            const modelTurn = msg.serverContent?.modelTurn;
-            if (modelTurn) {
-              const text = modelTurn.parts?.find(p => p.text)?.text;
-              if (text) {
-                const role = modelTurn.role === 'user' ? 'user' : 'model';
+            const text = msg.text;
+            if (text) {
+              const role = msg.serverContent?.modelTurn?.role === 'user' ? 'user' : 'model';
+              
+              setTranscript(prev => {
+                const lastItem = prev[prev.length - 1];
+                // If last item is same role and was added very recently (within 5s), update it
+                if (lastItem && lastItem.role === role && (Date.now() - lastItem.timestamp.getTime() < 5000)) {
+                  const newTranscript = [...prev];
+                  newTranscript[newTranscript.length - 1] = { ...lastItem, text };
+                  return newTranscript;
+                }
+                
                 const newItem: TranscriptItem = { 
                   id: Date.now().toString() + '-' + role + '-' + Math.random().toString(36).substr(2, 9), 
                   role, 
                   text, 
                   timestamp: new Date() 
                 };
-                setTranscript(prev => [...prev, newItem]);
-                
-                if (role === 'model') {
-                  performDeepAnalysis(newItem);
-                }
+                return [...prev, newItem];
+              });
+            }
+
+            if (msg.serverContent?.turnComplete) {
+              const lastItem = transcriptRef.current[transcriptRef.current.length - 1];
+              if (lastItem && lastItem.role === 'model') {
+                performDeepAnalysis(lastItem);
               }
             }
           },
-          onclose: () => { setIsConnected(false); stopMic(); },
+          onclose: () => { 
+            console.log("Session Closed");
+            setIsConnected(false); 
+            stopMic(); 
+          },
           onerror: (err: any) => {
             console.error("Gemini Error:", err);
             const errorMsg = err.message || "알 수 없는 오류";
-            if (errorMsg.includes('API_KEY_INVALID') || errorMsg.includes('not found')) {
-              setError("API 키가 유효하지 않거나 설정되지 않았습니다. 'Settings'에서 키를 확인해 주세요.");
-            } else {
-              setError(`통역 세션 연결 중 오류가 발생했습니다: ${errorMsg}`);
-            }
+            setError(`통역 세션 오류: ${errorMsg}`);
             setIsConnecting(false);
           }
         }
@@ -535,7 +564,11 @@ export default function InterpreterPage() {
   const performDeepAnalysis = async (item: TranscriptItem) => {
     setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, isAnalyzing: true } : t));
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY! });
+      let apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+      if (!apiKey) apiKey = (process.env as any).API_KEY;
+      if (!apiKey) throw new Error("API key missing");
+
+      const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: `Analyze this translation from ${sourceLang} to ${targetLang}: "${item.text}"`,
@@ -583,11 +616,13 @@ export default function InterpreterPage() {
               <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
                 <Languages className="w-4 h-4" />
               </div>
-              <h1 className="text-lg font-bold tracking-tight">AI-Live-Interpreter</h1>
+              <h1 className="text-lg font-bold tracking-tight">NEURAL LENS</h1>
             </div>
             <div className="flex items-center gap-2">
-              <div className={cn("w-2 h-2 rounded-full", isConnected ? "bg-emerald-500 animate-pulse" : "bg-white/20")} />
-              <span className="text-[10px] font-mono opacity-50 uppercase">{isConnected ? 'Live' : 'Idle'}</span>
+              <div className={cn("w-2 h-2 rounded-full", isConnecting ? "bg-amber-500 animate-pulse" : isConnected ? "bg-emerald-500 animate-pulse" : "bg-white/20")} />
+              <span className="text-[10px] font-mono opacity-50 uppercase">
+                {isConnecting ? 'Linking' : isConnected ? 'Online' : 'Offline'}
+              </span>
             </div>
           </div>
 
