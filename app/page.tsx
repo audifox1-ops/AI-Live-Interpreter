@@ -408,29 +408,32 @@ export default function InterpreterPage() {
               playQueue();
             }
 
-            // Handle Model Transcription (Translation Result)
-            const modelText = msg.serverContent?.modelTurn?.parts?.find(p => p.text)?.text;
-            if (modelText) {
-              const newItem: TranscriptItem = { 
-                id: Date.now().toString() + '-model', 
-                role: 'model', 
-                text: modelText, 
-                timestamp: new Date() 
-              };
-              setTranscript(prev => [...prev, newItem]);
-              // Automatically trigger deep analysis for translation
-              performDeepAnalysis(newItem);
+            // Handle Interruption
+            if (msg.serverContent?.interrupted) {
+              audioQueueRef.current = [];
+              // We could stop the current source if we tracked it, but clearing the queue is a good start.
             }
 
-            // Handle User Transcription (Original Speech)
-            const userText = (msg.serverContent as any)?.userTurn?.parts?.find((p: any) => p.text)?.text;
-            if (userText) {
-              setTranscript(prev => [...prev, { 
-                id: Date.now().toString() + '-user', 
-                role: 'user', 
-                text: userText, 
-                timestamp: new Date() 
-              }]);
+            // Handle Transcriptions
+            const modelTurn = msg.serverContent?.modelTurn;
+            if (modelTurn) {
+              const text = modelTurn.parts?.find(p => p.text)?.text;
+              if (text) {
+                // In Gemini Live, transcriptions are delivered in modelTurn.
+                // If it's the user's speech transcription, the role is often 'user'.
+                const role = modelTurn.role === 'user' ? 'user' : 'model';
+                const newItem: TranscriptItem = { 
+                  id: Date.now().toString() + '-' + role + '-' + Math.random().toString(36).substr(2, 9), 
+                  role, 
+                  text, 
+                  timestamp: new Date() 
+                };
+                setTranscript(prev => [...prev, newItem]);
+                
+                if (role === 'model') {
+                  performDeepAnalysis(newItem);
+                }
+              }
             }
           },
           onclose: () => { setIsConnected(false); stopMic(); },
