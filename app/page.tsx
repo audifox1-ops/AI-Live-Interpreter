@@ -343,6 +343,10 @@ export default function InterpreterPage() {
   const transcriptRef = useRef<TranscriptItem[]>([]);
   useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
 
+  const isRecordingRef = useRef(false);
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   // Hydration fix & Clock
   useEffect(() => {
     const updateTime = () => setCurrentTime(format(new Date(), 'HH:mm:ss'));
@@ -365,6 +369,22 @@ export default function InterpreterPage() {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
     }
     if (audioContextRef.current.state === 'suspended') await audioContextRef.current.resume();
+  };
+
+  const handleToggleRecording = async () => {
+    if (isRecordingRef.current) {
+      stopMic();
+      if (sessionRef.current && isConnected) {
+        // [수정 요구사항 4] 발언 종료 신호 전송
+        sessionRef.current.send({ clientContent: { turnComplete: true } });
+      }
+    } else {
+      if (!isConnected) {
+        await connect();
+      } else {
+        await startMic();
+      }
+    }
   };
 
   const startMic = async () => {
@@ -398,8 +418,14 @@ export default function InterpreterPage() {
           }
           const base64 = btoa(binary);
           
-          sessionRef.current.sendRealtimeInput({ 
-            audio: { data: base64, mimeType: 'audio/pcm;rate=16000' } 
+          // [수정 요구사항 1] 오디오 송신 규격 수정 (mediaChunks 사용)
+          sessionRef.current.send({ 
+            realtimeInput: { 
+              mediaChunks: [{ 
+                mimeType: "audio/pcm;rate=16000", 
+                data: base64 
+              }] 
+            } 
           });
         }
         
@@ -407,6 +433,19 @@ export default function InterpreterPage() {
         analyser.getByteFrequencyData(data);
         const average = data.reduce((a, b) => a + b) / data.length;
         setMicLevel(average / 128);
+
+        // Silence Detection (Auto-turn)
+        const threshold = 15; 
+        if (average > threshold) {
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+        } else if (isRecordingRef.current && !silenceTimerRef.current) {
+          silenceTimerRef.current = setTimeout(() => {
+            handleToggleRecording();
+          }, 1500); 
+        }
       };
 
       processorRef.current = processor;
@@ -419,6 +458,10 @@ export default function InterpreterPage() {
   };
 
   const stopMic = () => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     streamRef.current?.getTracks().forEach(t => t.stop());
     processorRef.current?.disconnect();
     setIsRecording(false);
@@ -475,8 +518,10 @@ export default function InterpreterPage() {
     try {
       const ai = new GoogleGenAI({ apiKey });
       const session = await ai.live.connect({
-        model: "gemini-2.5-flash-native-audio-preview-12-2025",
+        // [수정 요구사항 3] 모델 설정 변경
+        model: "gemini-2.0-flash-exp",
         config: {
+          // [수정 요구사항 3] Modality 설정 (텍스트와 오디오 모두 응답)
           responseModalities: [Modality.AUDIO],
           systemInstruction: isManualMode 
             ? `You are a professional interpreter. Translate ONLY from ${sourceLang} to ${targetLang}. If the user speaks ${targetLang}, do not translate. Provide the translation as both high-quality audio and clear text transcription.`
@@ -492,47 +537,48 @@ export default function InterpreterPage() {
             startMic(); 
           },
           onmessage: (msg: LiveServerMessage) => {
-            // Handle Audio Output
-            const base64Data = msg.data;
-            if (base64Data) {
-              const binary = atob(base64Data);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-              audioQueueRef.current.push(new Int16Array(bytes.buffer));
-              playQueue();
+            // [수정 요구사항 2] 메시지 수신 규격 수정 (parts 배열 순회)
+            if (msg.serverContent?.modelTurn?.parts) {
+              for (const part of msg.serverContent.modelTurn.parts) {
+                // 텍스트 추출
+                if (part.text) {
+                  const role = 'model';
+                  setTranscript(prev => {
+                    const lastItem = prev[prev.length - 1];
+                    if (lastItem && lastItem.role === role && (Date.now() - lastItem.timestamp.getTime() < 5000)) {
+                      const newTranscript = [...prev];
+                      newTranscript[newTranscript.length - 1] = { 
+                        ...lastItem, 
+                        text: lastItem.text + part.text! 
+                      };
+                      return newTranscript;
+                    }
+                    
+                    const newItem: TranscriptItem = { 
+                      id: Date.now().toString() + '-' + role + '-' + Math.random().toString(36).substr(2, 9), 
+                      role, 
+                      text: part.text!, 
+                      timestamp: new Date() 
+                    };
+                    return [...prev, newItem];
+                  });
+                }
+
+                // 오디오 추출
+                if (part.inlineData?.data) {
+                  const binary = atob(part.inlineData.data);
+                  const bytes = new Uint8Array(binary.length);
+                  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                  audioQueueRef.current.push(new Int16Array(bytes.buffer));
+                  playQueue();
+                }
+              }
             }
 
             // Handle Interruption
             if (msg.serverContent?.interrupted) {
               audioQueueRef.current = [];
               isPlayingRef.current = false;
-            }
-
-            // Handle Transcriptions
-            const text = msg.text;
-            if (text) {
-              const role = msg.serverContent?.modelTurn?.role === 'user' ? 'user' : 'model';
-              
-              setTranscript(prev => {
-                const lastItem = prev[prev.length - 1];
-                // If last item is same role and was added very recently (within 5s), update it
-                if (lastItem && lastItem.role === role && (Date.now() - lastItem.timestamp.getTime() < 5000)) {
-                  const newTranscript = [...prev];
-                  newTranscript[newTranscript.length - 1] = { 
-                    ...lastItem, 
-                    text: lastItem.text + text // Append text chunk
-                  };
-                  return newTranscript;
-                }
-                
-                const newItem: TranscriptItem = { 
-                  id: Date.now().toString() + '-' + role + '-' + Math.random().toString(36).substr(2, 9), 
-                  role, 
-                  text, 
-                  timestamp: new Date() 
-                };
-                return [...prev, newItem];
-              });
             }
 
             if (msg.serverContent?.turnComplete) {
@@ -560,21 +606,6 @@ export default function InterpreterPage() {
       console.error("Connection failed:", err);
       setError("서버 연결에 실패했습니다.");
       setIsConnecting(false);
-    }
-  };
-
-  const handleToggleRecording = async () => {
-    if (isRecording) {
-      stopMic();
-      if (sessionRef.current && isConnected) {
-        sessionRef.current.send({ clientContent: { turnComplete: true } });
-      }
-    } else {
-      if (!isConnected) {
-        await connect();
-      } else {
-        await startMic();
-      }
     }
   };
 
