@@ -1,5 +1,5 @@
 {
-  "name": "Gemini Live Interpreter",
+  "name": "AI-Live-Interpreter",
   "description": "A real-time voice-to-voice translation application powered by Gemini Live API.",
   "requestFramePermissions": ["microphone"]
 }
