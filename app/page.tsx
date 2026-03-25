@@ -442,15 +442,27 @@ export default function InterpreterPage() {
   const connect = async () => {
     if (isConnecting || isConnected) return;
     
-    if (!process.env.NEXT_PUBLIC_GEMINI_API_KEY) {
-      setError("API 키가 설정되지 않았습니다.");
+    let apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    
+    // If key is missing, try to prompt user via AI Studio UI if available
+    if (!apiKey && typeof window !== 'undefined' && (window as any).aistudio) {
+      const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+      if (!hasKey) {
+        await (window as any).aistudio.openSelectKey();
+      }
+    }
+
+    if (!apiKey) apiKey = (process.env as any).API_KEY;
+
+    if (!apiKey) {
+      setError("API 키가 설정되지 않았습니다. 사이드바의 'Settings' 메뉴에서 Gemini API 키를 설정해 주세요.");
       return;
     }
 
     setIsConnecting(true);
     setError(null);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
+      const ai = new GoogleGenAI({ apiKey });
       const session = await ai.live.connect({
         model: "gemini-2.5-flash-native-audio-preview-12-2025",
         config: {
@@ -502,7 +514,12 @@ export default function InterpreterPage() {
           onclose: () => { setIsConnected(false); stopMic(); },
           onerror: (err: any) => {
             console.error("Gemini Error:", err);
-            setError("통역 세션 연결 중 오류가 발생했습니다.");
+            const errorMsg = err.message || "알 수 없는 오류";
+            if (errorMsg.includes('API_KEY_INVALID') || errorMsg.includes('not found')) {
+              setError("API 키가 유효하지 않거나 설정되지 않았습니다. 'Settings'에서 키를 확인해 주세요.");
+            } else {
+              setError(`통역 세션 연결 중 오류가 발생했습니다: ${errorMsg}`);
+            }
             setIsConnecting(false);
           }
         }
