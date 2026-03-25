@@ -1,0 +1,64 @@
+{
+  "entities": {
+    "Feedback": {
+      "title": "Feedback",
+      "description": "User feedback on translation quality",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "sourceLang": { "type": "string" },
+        "targetLang": { "type": "string" },
+        "originalText": { "type": "string" },
+        "translatedText": { "type": "string" },
+        "rating": { "type": "string", "enum": ["up", "down"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "sourceLang", "targetLang", "originalText", "translatedText", "rating", "timestamp"]
+    },
+    "Session": {
+      "title": "Session",
+      "description": "A translation session containing multiple messages",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "sourceLang": { "type": "string" },
+        "targetLang": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "createdAt", "updatedAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A single translation message within a session",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "text": { "type": "string" },
+        "sourceLang": { "type": "string" },
+        "targetLang": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["sessionId", "role", "text", "timestamp"]
+    }
+  },
+  "firestore": {
+    "feedbacks": {
+      "schema": "Feedback",
+      "description": "Collection of translation feedbacks"
+    },
+    "sessions": {
+      "schema": "Session",
+      "description": "Collection of translation sessions"
+    },
+    "sessions/{sessionId}/messages": {
+      "schema": "Message",
+      "description": "Subcollection of messages for a session"
+    }
+  }
+}

@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: feedbacks
+    // Fields:
+    //   - userId: string (required)
+    //   - sourceLang: string (required)
+    //   - targetLang: string (required)
+    //   - originalText: string (required)
+    //   - translatedText: string (required)
+    //   - rating: string (required, 'up' or 'down')
+    //   - timestamp: timestamp (required)
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidFeedback(data) {
+      return data.keys().hasAll(['userId', 'sourceLang', 'targetLang', 'originalText', 'translatedText', 'rating', 'timestamp']) &&
+             data.userId is string &&
+             data.sourceLang is string &&
+             data.targetLang is string &&
+             data.originalText is string &&
+             data.translatedText is string &&
+             data.rating in ['up', 'down'] &&
+             data.timestamp is timestamp;
+    }
+
+    match /feedbacks/{feedbackId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated() && isOwner(request.resource.data.userId) && isValidFeedback(request.resource.data);
+      allow update, delete: if false; // Feedbacks are immutable
+    }
+    
+    match /sessions/{sessionId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated() && isOwner(request.resource.data.userId);
+      allow update: if isOwner(resource.data.userId);
+      allow delete: if isOwner(resource.data.userId);
+
+      match /messages/{messageId} {
+        allow read: if isAuthenticated() && get(/databases/$(database)/documents/sessions/$(sessionId)).data.userId == request.auth.uid;
+        allow create: if isAuthenticated() && get(/databases/$(database)/documents/sessions/$(sessionId)).data.userId == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+    
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+  }
+}
