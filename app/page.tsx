@@ -456,7 +456,6 @@ export default function InterpreterPage() {
     
     let apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
     
-    // If key is missing, try to prompt user via AI Studio UI if available
     if (!apiKey && typeof window !== 'undefined' && (window as any).aistudio) {
       const hasKey = await (window as any).aistudio.hasSelectedApiKey();
       if (!hasKey) {
@@ -519,7 +518,10 @@ export default function InterpreterPage() {
                 // If last item is same role and was added very recently (within 5s), update it
                 if (lastItem && lastItem.role === role && (Date.now() - lastItem.timestamp.getTime() < 5000)) {
                   const newTranscript = [...prev];
-                  newTranscript[newTranscript.length - 1] = { ...lastItem, text };
+                  newTranscript[newTranscript.length - 1] = { 
+                    ...lastItem, 
+                    text: lastItem.text + text // Append text chunk
+                  };
                   return newTranscript;
                 }
                 
@@ -558,6 +560,21 @@ export default function InterpreterPage() {
       console.error("Connection failed:", err);
       setError("서버 연결에 실패했습니다.");
       setIsConnecting(false);
+    }
+  };
+
+  const handleToggleRecording = async () => {
+    if (isRecording) {
+      stopMic();
+      if (sessionRef.current && isConnected) {
+        sessionRef.current.send({ clientContent: { turnComplete: true } });
+      }
+    } else {
+      if (!isConnected) {
+        await connect();
+      } else {
+        await startMic();
+      }
     }
   };
 
@@ -686,7 +703,7 @@ export default function InterpreterPage() {
                 <div className={cn(
                   "relative p-5 rounded-[1.8rem] text-sm leading-relaxed max-w-[85%]",
                   item.role === 'user' 
-                    ? "bg-white/5 border border-white/10 rounded-tr-none" 
+                    ? "bg-white text-black rounded-tr-none" 
                     : "bg-indigo-500/10 border border-indigo-500/20 italic font-serif rounded-tl-none"
                 )}>
                   {item.role === 'model' ? (
@@ -757,18 +774,18 @@ export default function InterpreterPage() {
                 <Ripple active={isRecording} />
                 <motion.button 
                   whileTap={{ scale: 0.9 }}
-                  onClick={isConnected ? () => sessionRef.current?.close() : connect}
+                  onClick={handleToggleRecording}
                   disabled={isConnecting}
                   className={cn(
                     "relative z-10 w-20 h-20 rounded-full flex items-center justify-center shadow-2xl transition-all",
-                    isConnected 
+                    isRecording 
                       ? "bg-red-500 shadow-red-500/40" 
                       : "bg-white shadow-white/10"
                   )}
                 >
                   {isConnecting ? (
                     <Loader2 className="w-8 h-8 animate-spin text-black" />
-                  ) : isConnected ? (
+                  ) : isRecording ? (
                     <MicOff className="w-8 h-8 text-white" />
                   ) : (
                     <Mic className="w-8 h-8 text-black" />
