@@ -327,8 +327,10 @@ export default function InterpreterPage() {
   const [micLevel, setMicLevel] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [isManualMode, setIsManualMode] = useState(false);
+  const [formality, setFormality] = useState<'Neutral' | 'Formal' | 'Casual'>('Neutral');
   
   // UI States
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSourceLangOpen, setIsSourceLangOpen] = useState(false);
   const [isTargetLangOpen, setIsTargetLangOpen] = useState(false);
 
@@ -363,31 +365,76 @@ export default function InterpreterPage() {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [transcript]);
 
+  const swapLanguages = () => {
+    const temp = sourceLang;
+    setSourceLang(targetLang);
+    setTargetLang(temp);
+  };
+
   // Audio Logic
-  const initAudio = async () => {
+  const initAudio = useCallback(async () => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
     }
     if (audioContextRef.current.state === 'suspended') await audioContextRef.current.resume();
-  };
+  }, []);
 
-  const handleToggleRecording = async () => {
-    if (isRecordingRef.current) {
-      stopMic();
-      if (sessionRef.current && isConnected) {
-        // [수정 요구사항 4] 발언 종료 신호 전송
-        sessionRef.current.send({ clientContent: { turnComplete: true } });
-      }
-    } else {
-      if (!isConnected) {
-        await connect();
-      } else {
-        await startMic();
-      }
+  const stopMic = useCallback(() => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
-  };
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    processorRef.current?.disconnect();
+    setIsRecording(false);
+    setMicLevel(0);
+  }, []);
 
-  const startMic = async () => {
+  const handleToggleRecordingRef = useRef<() => Promise<void>>(async () => {});
+
+  const playQueue = useCallback(async () => {
+    if (isPlayingRef.current || audioQueueRef.current.length === 0 || !audioContextRef.current) return;
+    isPlayingRef.current = true;
+    const pcm = audioQueueRef.current.shift()!;
+    const float = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) float[i] = pcm[i] / 0x7FFF;
+
+    const buffer = audioContextRef.current.createBuffer(1, float.length, 24000);
+    buffer.getChannelData(0).set(float);
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContextRef.current.destination);
+    source.onended = () => { 
+      isPlayingRef.current = false; 
+      playQueue(); 
+    };
+    source.start();
+  }, []);
+
+  const performDeepAnalysis = useCallback(async (item: TranscriptItem) => {
+    setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, isAnalyzing: true } : t));
+    try {
+      let apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+      if (!apiKey) apiKey = (process.env as any).API_KEY;
+      if (!apiKey) throw new Error("API key missing");
+
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Analyze this translation from ${sourceLang} to ${targetLang}: "${item.text}"`,
+        config: { responseMimeType: "application/json", responseSchema: analysisSchema }
+      });
+      const analysis = JSON.parse(response.text || '{}');
+      setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, analysis, isAnalyzing: false } : t));
+      setSelectedAnalysis(analysis);
+    } catch (err) {
+      console.error("Analysis failed:", err);
+      setError("번역 분석 중 오류가 발생했습니다.");
+      setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, isAnalyzing: false } : t));
+    }
+  }, [sourceLang, targetLang]);
+
+  const startMic = useCallback(async () => {
     try {
       await initAudio();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -418,14 +465,8 @@ export default function InterpreterPage() {
           }
           const base64 = btoa(binary);
           
-          // [수정 요구사항 1] 오디오 송신 규격 수정 (mediaChunks 사용)
-          sessionRef.current.send({ 
-            realtimeInput: { 
-              mediaChunks: [{ 
-                mimeType: "audio/pcm;rate=16000", 
-                data: base64 
-              }] 
-            } 
+          sessionRef.current.sendRealtimeInput({ 
+            audio: { data: base64, mimeType: 'audio/pcm;rate=16000' } 
           });
         }
         
@@ -434,7 +475,6 @@ export default function InterpreterPage() {
         const average = data.reduce((a, b) => a + b) / data.length;
         setMicLevel(average / 128);
 
-        // Silence Detection (Auto-turn)
         const threshold = 15; 
         if (average > threshold) {
           if (silenceTimerRef.current) {
@@ -443,7 +483,7 @@ export default function InterpreterPage() {
           }
         } else if (isRecordingRef.current && !silenceTimerRef.current) {
           silenceTimerRef.current = setTimeout(() => {
-            handleToggleRecording();
+            handleToggleRecordingRef.current();
           }, 1500); 
         }
       };
@@ -455,46 +495,10 @@ export default function InterpreterPage() {
       console.error("Mic error:", err);
       setError("마이크 시작 중 오류가 발생했습니다: " + (err.message || "권한을 확인해 주세요."));
     }
-  };
-
-  const stopMic = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    processorRef.current?.disconnect();
-    setIsRecording(false);
-    setMicLevel(0);
-  };
-
-  const playQueue = async () => {
-    if (isPlayingRef.current || audioQueueRef.current.length === 0 || !audioContextRef.current) return;
-    isPlayingRef.current = true;
-    const pcm = audioQueueRef.current.shift()!;
-    const float = new Float32Array(pcm.length);
-    for (let i = 0; i < pcm.length; i++) float[i] = pcm[i] / 0x7FFF;
-
-    const buffer = audioContextRef.current.createBuffer(1, float.length, 24000);
-    buffer.getChannelData(0).set(float);
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioContextRef.current.destination);
-    source.onended = () => { 
-      isPlayingRef.current = false; 
-      playQueue(); 
-    };
-    source.start();
-  };
-
-  const swapLanguages = () => {
-    const temp = sourceLang;
-    setSourceLang(targetLang);
-    setTargetLang(temp);
-  };
+  }, [initAudio, isConnected]);
 
   // Gemini Live Connection
-  const connect = async () => {
+  const connect = useCallback(async () => {
     if (isConnecting || isConnected) return;
     
     let apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
@@ -518,14 +522,16 @@ export default function InterpreterPage() {
     try {
       const ai = new GoogleGenAI({ apiKey });
       const session = await ai.live.connect({
-        // [수정 요구사항 3] 모델 설정 변경
-        model: "gemini-2.0-flash-exp",
+        model: "gemini-2.5-flash-native-audio-preview-12-2025",
         config: {
-          // [수정 요구사항 3] Modality 설정 (텍스트와 오디오 모두 응답)
           responseModalities: [Modality.AUDIO],
           systemInstruction: isManualMode 
-            ? `You are a professional interpreter. Translate ONLY from ${sourceLang} to ${targetLang}. If the user speaks ${targetLang}, do not translate. Provide the translation as both high-quality audio and clear text transcription.`
-            : `You are a professional interpreter. Translate ${sourceLang} to ${targetLang} and vice versa. Provide the translation as both high-quality audio and clear text transcription.`,
+            ? `You are a professional interpreter. Translate ONLY from ${sourceLang} to ${targetLang}. If the user speaks ${targetLang}, do not translate. 
+               Tone: ${formality}. 
+               Provide the translation as both high-quality audio and clear text transcription.`
+            : `You are a professional interpreter. Translate ${sourceLang} to ${targetLang} and vice versa. 
+               Tone: ${formality}. 
+               Provide the translation as both high-quality audio and clear text transcription.`,
           outputAudioTranscription: {},
           inputAudioTranscription: {},
         },
@@ -537,10 +543,8 @@ export default function InterpreterPage() {
             startMic(); 
           },
           onmessage: (msg: LiveServerMessage) => {
-            // [수정 요구사항 2] 메시지 수신 규격 수정 (parts 배열 순회)
             if (msg.serverContent?.modelTurn?.parts) {
               for (const part of msg.serverContent.modelTurn.parts) {
-                // 텍스트 추출
                 if (part.text) {
                   const role = 'model';
                   setTranscript(prev => {
@@ -564,7 +568,6 @@ export default function InterpreterPage() {
                   });
                 }
 
-                // 오디오 추출
                 if (part.inlineData?.data) {
                   const binary = atob(part.inlineData.data);
                   const bytes = new Uint8Array(binary.length);
@@ -575,7 +578,6 @@ export default function InterpreterPage() {
               }
             }
 
-            // Handle Interruption
             if (msg.serverContent?.interrupted) {
               audioQueueRef.current = [];
               isPlayingRef.current = false;
@@ -607,30 +609,46 @@ export default function InterpreterPage() {
       setError("서버 연결에 실패했습니다.");
       setIsConnecting(false);
     }
-  };
+  }, [isConnecting, isConnected, isManualMode, sourceLang, targetLang, formality, performDeepAnalysis, playQueue, startMic, stopMic]);
 
-  const performDeepAnalysis = async (item: TranscriptItem) => {
-    setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, isAnalyzing: true } : t));
-    try {
-      let apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-      if (!apiKey) apiKey = (process.env as any).API_KEY;
-      if (!apiKey) throw new Error("API key missing");
-
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `Analyze this translation from ${sourceLang} to ${targetLang}: "${item.text}"`,
-        config: { responseMimeType: "application/json", responseSchema: analysisSchema }
-      });
-      const analysis = JSON.parse(response.text || '{}');
-      setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, analysis, isAnalyzing: false } : t));
-      setSelectedAnalysis(analysis);
-    } catch (err) {
-      console.error("Analysis failed:", err);
-      setError("번역 분석 중 오류가 발생했습니다.");
-      setTranscript(prev => prev.map(t => t.id === item.id ? { ...t, isAnalyzing: false } : t));
+  const handleToggleRecording = useCallback(async () => {
+    if (isRecordingRef.current) {
+      if (sessionRef.current && isConnected) {
+        try {
+          sessionRef.current.send({ clientContent: { turnComplete: true } });
+        } catch (e) {
+          console.error("Failed to send turnComplete:", e);
+        }
+      }
+      stopMic();
+    } else {
+      if (!isConnected) {
+        await connect();
+      } else {
+        await startMic();
+      }
     }
-  };
+  }, [isConnected, stopMic, connect, startMic]);
+
+  useEffect(() => {
+    handleToggleRecordingRef.current = handleToggleRecording;
+  }, [handleToggleRecording]);
+
+  // Reconnect if languages change while connected
+  useEffect(() => {
+    if (isConnected) {
+      setError("언어 설정이 변경되었습니다. 최적의 통역을 위해 세션을 재연결합니다.");
+      const timer = setTimeout(() => {
+        stopMic();
+        if (sessionRef.current) {
+          sessionRef.current.close();
+        }
+        connect();
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [sourceLang, targetLang, isManualMode, formality, isConnected, connect, stopMic]);
+
 
   return (
     <div className="min-h-screen bg-neutral-950 flex items-center justify-center p-0 sm:p-4 font-sans selection:bg-indigo-500">
@@ -667,6 +685,12 @@ export default function InterpreterPage() {
               <h1 className="text-lg font-bold tracking-tight">NEURAL LENS</h1>
             </div>
             <div className="flex items-center gap-2">
+              <button 
+                onClick={() => setIsSettingsOpen(true)}
+                className="p-2 rounded-full bg-white/5 hover:bg-white/10 transition-colors"
+              >
+                <Settings2 className="w-5 h-5 text-white/60" />
+              </button>
               <div className={cn("w-2 h-2 rounded-full", isConnecting ? "bg-amber-500 animate-pulse" : isConnected ? "bg-emerald-500 animate-pulse" : "bg-white/20")} />
               <span className="text-[10px] font-mono opacity-50 uppercase">
                 {isConnecting ? 'Linking' : isConnected ? 'Online' : 'Offline'}
@@ -674,36 +698,48 @@ export default function InterpreterPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button 
-              onClick={() => setIsSourceLangOpen(true)}
-              className="flex-1 p-3 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-between hover:bg-white/10 transition-colors"
-            >
-              <div className="flex items-center gap-2">
-                <span className="text-lg">{LANGUAGES.find(l => l.name === sourceLang)?.flag}</span>
-                <span className="text-xs font-bold">{sourceLang}</span>
+          <button 
+            onClick={() => setIsSettingsOpen(true)}
+            className="w-full p-4 rounded-3xl bg-white/5 border border-white/10 flex items-center justify-between group hover:bg-white/10 transition-all"
+          >
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2 overflow-hidden">
+                <AnimatePresence mode="wait">
+                  <motion.div 
+                    key={sourceLang}
+                    initial={{ y: 10, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    exit={{ y: -10, opacity: 0 }}
+                    className="flex items-center gap-2"
+                  >
+                    <span className="text-2xl">{LANGUAGES.find(l => l.name === sourceLang)?.flag}</span>
+                    <span className="text-sm font-bold">{sourceLang}</span>
+                  </motion.div>
+                </AnimatePresence>
               </div>
-              <ChevronDown className="w-3 h-3 opacity-30" />
-            </button>
-
-            <button 
-              onClick={swapLanguages}
-              className="p-3 rounded-2xl bg-indigo-600/20 border border-indigo-500/20 text-indigo-400 hover:bg-indigo-600/30 transition-colors"
-            >
-              <RefreshCcw className="w-4 h-4" />
-            </button>
-
-            <button 
-              onClick={() => setIsTargetLangOpen(true)}
-              className="flex-1 p-3 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-between hover:bg-white/10 transition-colors"
-            >
-              <div className="flex items-center gap-2">
-                <span className="text-lg">{LANGUAGES.find(l => l.name === targetLang)?.flag}</span>
-                <span className="text-xs font-bold">{targetLang}</span>
+              <motion.div
+                animate={{ rotate: sourceLang === LANGUAGES[0].name ? 0 : 360 }}
+                transition={{ duration: 0.5 }}
+              >
+                <ArrowRight className="w-4 h-4 text-white/20 group-hover:text-indigo-400 transition-colors" />
+              </motion.div>
+              <div className="flex items-center gap-2 overflow-hidden">
+                <AnimatePresence mode="wait">
+                  <motion.div 
+                    key={targetLang}
+                    initial={{ y: 10, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    exit={{ y: -10, opacity: 0 }}
+                    className="flex items-center gap-2"
+                  >
+                    <span className="text-2xl">{LANGUAGES.find(l => l.name === targetLang)?.flag}</span>
+                    <span className="text-sm font-bold">{targetLang}</span>
+                  </motion.div>
+                </AnimatePresence>
               </div>
-              <ChevronDown className="w-3 h-3 opacity-30" />
-            </button>
-          </div>
+            </div>
+            <ChevronRight className="w-5 h-5 opacity-30" />
+          </button>
         </header>
 
         {/* Transcript Area */}
@@ -834,26 +870,134 @@ export default function InterpreterPage() {
 
         {/* Language Selection Bottom Sheets */}
         <BottomSheet 
+          isOpen={isSettingsOpen}
+          onClose={() => setIsSettingsOpen(false)}
+          title="Translation Settings"
+        >
+          <div className="space-y-8">
+            <div className="relative grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <label className="text-[10px] uppercase tracking-widest opacity-40 font-bold ml-1">Source</label>
+                <motion.button 
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={() => setIsSourceLangOpen(true)}
+                  className="w-full p-4 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-between"
+                >
+                  <div className="flex items-center gap-2">
+                    <span>{LANGUAGES.find(l => l.name === sourceLang)?.flag}</span>
+                    <span className="font-bold text-sm">{sourceLang}</span>
+                  </div>
+                  <ChevronDown className="w-4 h-4 opacity-30" />
+                </motion.button>
+              </div>
+
+              <div className="absolute left-1/2 top-[55%] -translate-x-1/2 -translate-y-1/2 z-10">
+                <motion.button
+                  whileHover={{ rotate: 180, scale: 1.1 }}
+                  whileTap={{ scale: 0.9 }}
+                  onClick={swapLanguages}
+                  className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/40 border border-white/10"
+                >
+                  <RefreshCcw className="w-4 h-4 text-white" />
+                </motion.button>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] uppercase tracking-widest opacity-40 font-bold ml-1">Target</label>
+                <motion.button 
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={() => setIsTargetLangOpen(true)}
+                  className="w-full p-4 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-between"
+                >
+                  <div className="flex items-center gap-2">
+                    <span>{LANGUAGES.find(l => l.name === targetLang)?.flag}</span>
+                    <span className="font-bold text-sm">{targetLang}</span>
+                  </div>
+                  <ChevronDown className="w-4 h-4 opacity-30" />
+                </motion.button>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <label className="text-[10px] uppercase tracking-widest opacity-40 font-bold ml-1">Tone & Formality</label>
+              <div className="flex gap-2">
+                {['Neutral', 'Formal', 'Casual'].map((t) => (
+                  <motion.button
+                    key={t}
+                    whileTap={{ scale: 0.95 }}
+                    onClick={() => setFormality(t as any)}
+                    className={cn(
+                      "flex-1 py-3 rounded-xl text-xs font-bold transition-all border",
+                      formality === t 
+                        ? "bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20" 
+                        : "bg-white/5 border-white/5 text-white/40 hover:bg-white/10"
+                    )}
+                  >
+                    {t}
+                  </motion.button>
+                ))}
+              </div>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-between">
+              <div className="space-y-1">
+                <h4 className="text-sm font-bold">Manual Mode</h4>
+                <p className="text-[10px] text-white/40 leading-relaxed">Translate only from source to target</p>
+              </div>
+              <button 
+                onClick={() => setIsManualMode(!isManualMode)}
+                className={cn(
+                  "w-12 h-6 rounded-full transition-colors relative",
+                  isManualMode ? "bg-indigo-600" : "bg-white/10"
+                )}
+              >
+                <div className={cn(
+                  "absolute top-1 w-4 h-4 rounded-full bg-white transition-all",
+                  isManualMode ? "left-7" : "left-1"
+                )} />
+              </button>
+            </div>
+
+            <motion.button 
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => setIsSettingsOpen(false)}
+              className="w-full py-4 rounded-2xl bg-white text-black font-bold uppercase tracking-widest text-xs shadow-xl shadow-white/5"
+            >
+              Apply Settings
+            </motion.button>
+          </div>
+        </BottomSheet>
+
+        <BottomSheet 
           isOpen={isSourceLangOpen} 
           onClose={() => setIsSourceLangOpen(false)} 
           title="Source Language"
         >
           <div className="grid grid-cols-1 gap-2">
             {LANGUAGES.map(lang => (
-              <button 
+              <motion.button 
                 key={lang.name}
+                whileHover={{ scale: 1.01 }}
+                whileTap={{ scale: 0.98 }}
                 onClick={() => { setSourceLang(lang.name); setIsSourceLangOpen(false); }}
                 className={cn(
                   "p-4 rounded-2xl flex items-center justify-between transition-all",
-                  sourceLang === lang.name ? "bg-indigo-600 text-white" : "bg-white/5 hover:bg-white/10"
+                  sourceLang === lang.name ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20" : "bg-white/5 hover:bg-white/10"
                 )}
               >
                 <div className="flex items-center gap-3">
                   <span className="text-xl">{lang.flag}</span>
                   <span className="font-bold">{lang.name}</span>
                 </div>
-                {sourceLang === lang.name && <CheckCircle2 className="w-5 h-5" />}
-              </button>
+                {sourceLang === lang.name && (
+                  <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }}>
+                    <CheckCircle2 className="w-5 h-5" />
+                  </motion.div>
+                )}
+              </motion.button>
             ))}
           </div>
         </BottomSheet>
@@ -865,20 +1009,26 @@ export default function InterpreterPage() {
         >
           <div className="grid grid-cols-1 gap-2">
             {LANGUAGES.map(lang => (
-              <button 
+              <motion.button 
                 key={lang.name}
+                whileHover={{ scale: 1.01 }}
+                whileTap={{ scale: 0.98 }}
                 onClick={() => { setTargetLang(lang.name); setIsTargetLangOpen(false); }}
                 className={cn(
                   "p-4 rounded-2xl flex items-center justify-between transition-all",
-                  targetLang === lang.name ? "bg-indigo-600 text-white" : "bg-white/5 hover:bg-white/10"
+                  targetLang === lang.name ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20" : "bg-white/5 hover:bg-white/10"
                 )}
               >
                 <div className="flex items-center gap-3">
                   <span className="text-xl">{lang.flag}</span>
                   <span className="font-bold">{lang.name}</span>
                 </div>
-                {targetLang === lang.name && <CheckCircle2 className="w-5 h-5" />}
-              </button>
+                {targetLang === lang.name && (
+                  <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }}>
+                    <CheckCircle2 className="w-5 h-5" />
+                  </motion.div>
+                )}
+              </motion.button>
             ))}
           </div>
         </BottomSheet>
